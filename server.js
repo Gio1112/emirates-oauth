@@ -14,7 +14,11 @@ const PORT = process.env.PORT || 3000;
    MIDDLEWARE
 ───────────────────────────────────────── */
 app.use(cors({
-  origin: process.env.FRONTEND_URL || '*',
+  origin: [
+    process.env.FRONTEND_URL,
+    'https://giorgio.is-a.dev',
+    'http://localhost:3000'
+  ].filter(Boolean),
   credentials: true
 }));
 app.use(express.json());
