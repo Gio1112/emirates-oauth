@@ -41,8 +41,8 @@ mongoose.connect(process.env.MONGODB_URI)
 /* ─────────────────────────────────────────
    DYNAMIC PRICING
 ───────────────────────────────────────── */
-const SEAT_TOTALS  = { economy: 150, business: 30, first: 14 };
-const BASE_PRICES  = { economy: 299,  business: 1499, first: 3999 };
+const SEAT_TOTALS  = { economy: 15, business: 15, first: 15 };
+const BASE_PRICES  = { economy: 299, business: 1499, first: 3999 };
 
 function dynamicPrice(cls, available) {
   const total = SEAT_TOTALS[cls] || 150;
@@ -59,14 +59,13 @@ async function getSeats(flightId) {
   const id = flightId.toString();
   let doc = await db.collection('flightSeats').findOne({ flightId: id });
   if (!doc) {
-    doc = { flightId: id, economy: 150, business: 30, first: 14 };
+    doc = { flightId: id, economy: 15, business: 15, first: 15 };
     await db.collection('flightSeats').insertOne(doc);
   }
-  // Clamp to 0
   return {
-    economy:  Math.max(0, doc.economy  ?? 150),
-    business: Math.max(0, doc.business ?? 30),
-    first:    Math.max(0, doc.first    ?? 14)
+    economy:  Math.max(0, doc.economy  ?? 15),
+    business: Math.max(0, doc.business ?? 15),
+    first:    Math.max(0, doc.first    ?? 15)
   };
 }
 
@@ -94,9 +93,9 @@ function normFlight(f, seats) {
     skywardsMiles:   miles,
     seats:           s,
     classes: {
-      economy:  { price: dynamicPrice('economy',  s.economy),  availableSeats: s.economy,  totalSeats: 150 },
-      business: { price: dynamicPrice('business', s.business), availableSeats: s.business, totalSeats: 30  },
-      first:    { price: dynamicPrice('first',    s.first),    availableSeats: s.first,    totalSeats: 14  }
+      economy:  { price: dynamicPrice('economy',  s.economy),  availableSeats: s.economy,  totalSeats: 15 },
+      business: { price: dynamicPrice('business', s.business), availableSeats: s.business, totalSeats: 15 },
+      first:    { price: dynamicPrice('first',    s.first),    availableSeats: s.first,    totalSeats: 15 }
     },
     milesEarned: {
       economy:  Math.round(miles * 0.5),
@@ -351,9 +350,32 @@ app.get('/api/flights/:id', async (req, res) => {
   }
 });
 
-/* ─────────────────────────────────────────
-   BOOKINGS
-───────────────────────────────────────── */
+app.get('/api/flights/:id/seats', async (req, res) => {
+  try {
+    const flightId = req.params.id;
+    // Find all non-cancelled bookings for this flight by fnum
+    let rawFlight;
+    try       { rawFlight = await db.collection('flights').findOne({ _id: new ObjectId(flightId) }); }
+    catch (_) { rawFlight = await db.collection('flights').findOne({ _id: flightId }); }
+    if (!rawFlight) return res.json({ economy: [], business: [], first: [] });
+
+    const fnum = rawFlight.fnum;
+    const bookings = await db.collection('bookings')
+      .find({ fnum: { $regex: fnum.split('/')[0].trim(), $options: 'i' }, status: { $ne: 'cancelled' } })
+      .toArray();
+
+    const taken = { economy: [], business: [], first: [] };
+    for (const b of bookings) {
+      if (b.seat) {
+        const cls = (b.class || 'Economy').toLowerCase();
+        if (taken[cls]) taken[cls].push(b.seat);
+      }
+    }
+    res.json(taken);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 app.get('/api/bookings', auth, async (req, res) => {
   try {
     const raw    = await db.collection('bookings').find({ discordId: req.user.discordId }).sort({ bookedAt: -1 }).toArray();
@@ -366,8 +388,8 @@ app.get('/api/bookings', auth, async (req, res) => {
 
 app.post('/api/bookings', auth, async (req, res) => {
   try {
-    const { flightId, class: cabinClass, passengers, seatNumbers } = req.body;
-    if (!flightId || !cabinClass || !passengers?.length)
+    const { flightId, class: cabinClass, robloxUser, seatNumbers } = req.body;
+    if (!flightId || !cabinClass || !robloxUser?.trim())
       return res.status(400).json({ error: 'Missing required fields' });
 
     let rawFlight;
@@ -384,7 +406,6 @@ app.post('/api/bookings', auth, async (req, res) => {
     const flight   = normFlight(rawFlight, seats);
     const miles    = flight.milesEarned[cabinClass] || 0;
     const price    = flight.classes[cabinClass]?.price || 0;
-    const paxName  = `${passengers[0]?.firstName || ''} ${passengers[0]?.lastName || ''}`.trim();
     const pnr      = `${rawFlight.fnum}-${Math.random().toString(36).substr(2,6).toUpperCase()}`;
     const seat     = seatNumbers?.[0] || null;
 
@@ -394,21 +415,20 @@ app.post('/api/bookings', auth, async (req, res) => {
       fnum:       rawFlight.fnum,
       class:      cabinClass.charAt(0).toUpperCase() + cabinClass.slice(1),
       discordId:  req.user.discordId,
-      robloxUser: paxName,
+      robloxUser: robloxUser.trim(),
       checkedIn:  false,
       seat,
       price,
-      passengers,
       status:     'confirmed',
       bookedAt:   new Date(),
       createdAt:  new Date(),
       updatedAt:  new Date()
     });
 
-    // Decrement seats by 10 per booking
+    // Decrement available seats by 1
     await db.collection('flightSeats').updateOne(
       { flightId: rawFlight._id.toString() },
-      { $inc: { [cabinClass]: -10 } },
+      { $inc: { [cabinClass]: -1 } },
       { upsert: true }
     );
 
