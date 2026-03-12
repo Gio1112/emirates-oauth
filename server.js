@@ -1,14 +1,16 @@
 require('dotenv').config();
-const express = require('express');
-const mongoose = require('mongoose');
-const axios = require('axios');
-const jwt = require('jsonwebtoken');
-const cors = require('cors');
+const express      = require('express');
+const mongoose     = require('mongoose');
+const axios        = require('axios');
+const jwt          = require('jsonwebtoken');
+const cors         = require('cors');
 const cookieParser = require('cookie-parser');
-const path = require('path');
+const path         = require('path');
+const { ObjectId } = require('mongodb');
 
-const app = express();
+const app  = express();
 const PORT = process.env.PORT || 3000;
+const JWT  = process.env.JWT_SECRET || 'emirates_secret_2024';
 
 /* ─────────────────────────────────────────
    MIDDLEWARE
@@ -26,120 +28,121 @@ app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
 /* ─────────────────────────────────────────
-   MONGODB CONNECTION
+   MONGODB
 ───────────────────────────────────────── */
-mongoose.connect(process.env.MONGODB_URI, {
-  useNewUrlParser: true,
-  useUnifiedTopology: true
-}).then(() => console.log('✅ MongoDB connected'))
+let db;
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => { db = mongoose.connection.db; console.log('✅ MongoDB connected'); })
   .catch(err => console.error('❌ MongoDB error:', err));
 
 /* ─────────────────────────────────────────
-   SCHEMAS & MODELS
+   NORMALIZERS — map bot schema → frontend
 ───────────────────────────────────────── */
-const flightSchema = new mongoose.Schema({
-  flightNumber: { type: String, required: true },
-  origin: String,
-  originCity: String,
-  destination: String,
-  destinationCity: String,
-  departureTime: Date,
-  arrivalTime: Date,
-  aircraft: String,
-  duration: String,
-  status: { type: String, default: 'scheduled' }, // scheduled, boarding, departed, landed, cancelled
-  classes: {
-    economy: { price: Number, availableSeats: Number, totalSeats: Number },
-    business: { price: Number, availableSeats: Number, totalSeats: Number },
-    first:    { price: Number, availableSeats: Number, totalSeats: Number }
-  },
-  milesEarned: { economy: Number, business: Number, first: Number }
-}, { collection: 'flights' });
 
-const bookingSchema = new mongoose.Schema({
-  discordId: { type: String, required: true },
-  flightId: { type: mongoose.Schema.Types.ObjectId, ref: 'Flight' },
-  flightNumber: String,
-  pnr: { type: String, unique: true },
-  class: String,
-  passengers: [{
-    firstName: String,
-    lastName: String,
-    dateOfBirth: String,
-    passportNumber: String,
-    nationality: String
-  }],
-  price: Number,
-  status: { type: String, default: 'confirmed' }, // confirmed, cancelled, checked-in, completed
-  milesEarned: Number,
-  seatNumbers: [String],
-  origin: String,
-  originCity: String,
-  destination: String,
-  destinationCity: String,
-  departureTime: Date,
-  arrivalTime: Date,
-  aircraft: String,
-  duration: String,
-  bookedAt: { type: Date, default: Date.now }
-}, { collection: 'bookings' });
+// Bot flight fields: fnum, departure, arrival, time (unix secs), skywardsMiles, status (UPPERCASE), aircraft
+function normFlight(f) {
+  if (!f) return null;
+  const miles = f.skywardsMiles || 1000;
+  return {
+    _id:             f._id,
+    flightNumber:    f.fnum,
+    origin:          f.departure,
+    originCity:      f.departure,
+    destination:     f.arrival,
+    destinationCity: f.arrival,
+    departureTime:   new Date((f.time || 0) * 1000),
+    aircraft:        f.aircraft  || '—',
+    status:          (f.status   || 'SCHEDULED').toLowerCase(),
+    route:           f.route     || `${f.departure}-${f.arrival}`,
+    codeshare:       f.codeshare || null,
+    imageUrl:        f.imageUrl  || null,
+    eventUrl:        f.eventUrl  || null,
+    skywardsMiles:   miles,
+    classes: {
+      economy:  { price: 0, availableSeats: 80, totalSeats: 200 },
+      business: { price: 0, availableSeats: 20, totalSeats: 42  },
+      first:    { price: 0, availableSeats: 8,  totalSeats: 14  }
+    },
+    milesEarned: {
+      economy:  Math.round(miles * 0.5),
+      business: Math.round(miles * 0.8),
+      first:    miles
+    }
+  };
+}
 
-const rewardSchema = new mongoose.Schema({
-  discordId: { type: String, required: true, unique: true },
-  skywardsNumber: String,
-  tier: { type: String, default: 'Blue' }, // Blue, Silver, Gold, Platinum
-  totalMilesEarned: { type: Number, default: 0 },
-  availableMiles: { type: Number, default: 0 },
-  transactions: [{
-    type: { type: String }, // earned, redeemed, bonus, cancelled
-    miles: Number,
-    description: String,
-    date: { type: Date, default: Date.now },
-    flightNumber: String,
-    pnr: String
-  }],
-  updatedAt: { type: Date, default: Date.now }
-}, { collection: 'rewards' });
+// Bot rewards: _id = discordId string, miles, lifetimeMiles, tier, flightsCompleted
+function normRewards(r, discordId) {
+  if (!r) return null;
+  return {
+    discordId,
+    skywardsNumber:   `EK${discordId}`.substring(0, 12),
+    tier:             r.tier             || 'Blue',
+    availableMiles:   r.miles            || 0,
+    totalMilesEarned: r.lifetimeMiles    || r.miles || 0,
+    flightsCompleted: r.flightsCompleted || 0,
+    achievements:     r.achievements     || [],
+    transactions:     []
+  };
+}
 
-const Flight  = mongoose.model('Flight', flightSchema);
-const Booking = mongoose.model('Booking', bookingSchema);
-const Reward  = mongoose.model('Reward', rewardSchema);
+// Bot booking fields: code (PNR), fnum, class (capitalised), discordId, checkedIn, robloxUser
+async function normBooking(b) {
+  let flight = null;
+  if (b.fnum) {
+    const fnumClean = b.fnum.split('/')[0].trim();
+    flight = await db.collection('flights').findOne({ fnum: { $regex: fnumClean, $options: 'i' } });
+  }
+  return {
+    _id:             b._id,
+    discordId:       b.discordId,
+    pnr:             b.code,
+    flightNumber:    b.fnum,
+    class:           (b.class || 'economy').toLowerCase(),
+    status:          b.checkedIn ? 'checked-in' : 'confirmed',
+    origin:          flight?.departure || '—',
+    originCity:      flight?.departure || '—',
+    destination:     flight?.arrival   || '—',
+    destinationCity: flight?.arrival   || '—',
+    departureTime:   flight ? new Date(flight.time * 1000) : (b.bookedAt || new Date()),
+    aircraft:        flight?.aircraft  || '—',
+    milesEarned:     flight?.skywardsMiles || 0,
+    price:           0,
+    passengers:      b.robloxUser ? [{ firstName: b.robloxUser, lastName: '' }] : [],
+    seatNumbers:     b.seat ? [b.seat] : [],
+    bookedAt:        b.bookedAt || b.createdAt || new Date()
+  };
+}
 
 /* ─────────────────────────────────────────
    AUTH MIDDLEWARE
 ───────────────────────────────────────── */
-const authenticate = (req, res, next) => {
+const auth = (req, res, next) => {
   const token = req.headers.authorization?.split(' ')[1] || req.cookies?.ek_token;
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
-  try {
-    req.user = jwt.verify(token, process.env.JWT_SECRET || 'emirates_secret_2024');
-    next();
-  } catch {
-    res.status(401).json({ error: 'Invalid or expired token' });
-  }
+  try { req.user = jwt.verify(token, JWT); next(); }
+  catch { res.status(401).json({ error: 'Invalid or expired token' }); }
 };
 
 /* ─────────────────────────────────────────
-   DISCORD OAUTH ROUTES
+   DISCORD OAUTH
 ───────────────────────────────────────── */
 app.get('/auth/discord', (req, res) => {
   const params = new URLSearchParams({
     client_id:     process.env.DISCORD_CLIENT_ID,
     redirect_uri:  process.env.DISCORD_REDIRECT_URI,
     response_type: 'code',
-    scope:         'identify email'
+    scope:         'identify'
   });
   res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
 });
 
 app.get('/auth/discord/callback', async (req, res) => {
   const { code } = req.query;
-  const frontend = process.env.FRONTEND_URL || '/';
-
+  const frontend  = process.env.FRONTEND_URL || '/';
   if (!code) return res.redirect(`${frontend}?error=no_code`);
 
   try {
-    // Exchange code for access token
     const tokenRes = await axios.post(
       'https://discord.com/api/oauth2/token',
       new URLSearchParams({
@@ -153,67 +156,23 @@ app.get('/auth/discord/callback', async (req, res) => {
     );
 
     const { access_token } = tokenRes.data;
-
-    // Fetch Discord user info
     const userRes = await axios.get('https://discord.com/api/users/@me', {
       headers: { Authorization: `Bearer ${access_token}` }
     });
     const discord = userRes.data;
 
-    // Find or create user in botconfigs collection
-    const db = mongoose.connection.db;
-    let user = await db.collection('botconfigs').findOne({ discordId: discord.id });
+    // Bot stores rewards with _id = discordId string
+    const rewards = await db.collection('rewards').findOne({ _id: discord.id });
+    const tier    = rewards?.tier || 'Blue';
 
-    if (!user) {
-      const skywardsNumber = `EK${Math.floor(100000000 + Math.random() * 900000000)}`;
-      user = {
-        discordId:      discord.id,
-        username:       discord.username,
-        discriminator:  discord.discriminator || '0',
-        avatar:         discord.avatar,
-        email:          discord.email || null,
-        skywardsNumber,
-        tier:           'Blue',
-        createdAt:      new Date()
-      };
-      await db.collection('botconfigs').insertOne(user);
+    const token = jwt.sign({
+      discordId: discord.id,
+      username:  discord.username,
+      avatar:    discord.avatar,
+      tier
+    }, JWT, { expiresIn: '7d' });
 
-      // Seed rewards record
-      await Reward.create({
-        discordId:       discord.id,
-        skywardsNumber,
-        tier:            'Blue',
-        totalMilesEarned: 0,
-        availableMiles:  0,
-        transactions:    [{
-          type:        'bonus',
-          miles:       500,
-          description: 'Welcome to Emirates Skywards!',
-          date:        new Date()
-        }]
-      });
-      // Give welcome bonus
-      await Reward.findOneAndUpdate({ discordId: discord.id }, {
-        $inc: { totalMilesEarned: 500, availableMiles: 500 }
-      });
-    }
-
-    // Ensure rewards record exists
-    let reward = await Reward.findOne({ discordId: discord.id });
-    if (!reward) {
-      reward = await Reward.create({ discordId: discord.id, skywardsNumber: user.skywardsNumber });
-    }
-
-    // Issue JWT
-    const jwtToken = jwt.sign({
-      discordId:      discord.id,
-      username:       discord.username,
-      avatar:         discord.avatar,
-      skywardsNumber: user.skywardsNumber,
-      tier:           user.tier || 'Blue'
-    }, process.env.JWT_SECRET || 'emirates_secret_2024', { expiresIn: '7d' });
-
-    res.redirect(`${frontend}?token=${jwtToken}`);
+    res.redirect(`${frontend}?token=${token}`);
   } catch (err) {
     console.error('OAuth error:', err.response?.data || err.message);
     res.redirect(`${frontend}?error=auth_failed`);
@@ -226,51 +185,53 @@ app.get('/auth/logout', (req, res) => {
 });
 
 /* ─────────────────────────────────────────
-   USER ROUTES
+   USER — /api/me
 ───────────────────────────────────────── */
-app.get('/api/me', authenticate, async (req, res) => {
+app.get('/api/me', auth, async (req, res) => {
   try {
-    const db = mongoose.connection.db;
-    const user    = await db.collection('botconfigs').findOne({ discordId: req.user.discordId });
-    const rewards = await Reward.findOne({ discordId: req.user.discordId });
-    if (!user) return res.status(404).json({ error: 'User not found' });
-    res.json({ user, rewards });
+    const { discordId, username, avatar } = req.user;
+    // Bot rewards: _id = discordId string (NOT an ObjectId)
+    const raw = await db.collection('rewards').findOne({ _id: discordId });
+    res.json({
+      user: { discordId, username, avatar, skywardsNumber: `EK${discordId}`.substring(0, 12) },
+      rewards: normRewards(raw, discordId)
+    });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 /* ─────────────────────────────────────────
-   FLIGHT ROUTES
+   FLIGHTS
 ───────────────────────────────────────── */
-app.get('/api/flights', async (req, res) => {
+app.get('/api/flights/popular', async (req, res) => {
   try {
-    const { origin, destination, date, class: cabinClass } = req.query;
-    const query = { status: { $ne: 'cancelled' }, departureTime: { $gte: new Date() } };
-
-    if (origin)      query.origin      = origin.toUpperCase();
-    if (destination) query.destination = destination.toUpperCase();
-    if (date) {
-      const d   = new Date(date);
-      const end = new Date(date);
-      end.setDate(end.getDate() + 1);
-      query.departureTime = { $gte: d, $lt: end };
-    }
-
-    const flights = await Flight.find(query).sort({ departureTime: 1 }).limit(30);
-    res.json(flights);
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const flights = await db.collection('flights')
+      .find({ status: { $nin: ['CANCELLED', 'COMPLETED'] }, time: { $gte: nowUnix } })
+      .sort({ time: 1 })
+      .limit(10)
+      .toArray();
+    res.json(flights.map(normFlight));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/api/flights/popular', async (req, res) => {
+app.get('/api/flights', async (req, res) => {
   try {
-    const flights = await Flight.find({
-      status: { $ne: 'cancelled' },
-      departureTime: { $gte: new Date() }
-    }).sort({ departureTime: 1 }).limit(6);
-    res.json(flights);
+    const { origin, destination, date } = req.query;
+    const nowUnix = Math.floor(Date.now() / 1000);
+    const query   = { status: { $nin: ['CANCELLED', 'COMPLETED'] }, time: { $gte: nowUnix } };
+    if (origin)      query.departure = origin.toUpperCase();
+    if (destination) query.arrival   = destination.toUpperCase();
+    if (date) {
+      const d = new Date(date), dEnd = new Date(date);
+      dEnd.setDate(dEnd.getDate() + 1);
+      query.time = { $gte: Math.floor(d / 1000), $lt: Math.floor(dEnd / 1000) };
+    }
+    const flights = await db.collection('flights').find(query).sort({ time: 1 }).limit(30).toArray();
+    res.json(flights.map(normFlight));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -278,192 +239,106 @@ app.get('/api/flights/popular', async (req, res) => {
 
 app.get('/api/flights/:id', async (req, res) => {
   try {
-    const flight = await Flight.findById(req.params.id);
-    if (!flight) return res.status(404).json({ error: 'Flight not found' });
-    res.json(flight);
+    let f;
+    try       { f = await db.collection('flights').findOne({ _id: new ObjectId(req.params.id) }); }
+    catch (_) { f = await db.collection('flights').findOne({ _id: req.params.id }); }
+    if (!f) return res.status(404).json({ error: 'Flight not found' });
+    res.json(normFlight(f));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 /* ─────────────────────────────────────────
-   BOOKING ROUTES
+   BOOKINGS
 ───────────────────────────────────────── */
-app.post('/api/bookings', authenticate, async (req, res) => {
+app.get('/api/bookings', auth, async (req, res) => {
   try {
-    const { flightId, class: cabinClass, passengers } = req.body;
+    const raw    = await db.collection('bookings').find({ discordId: req.user.discordId }).sort({ bookedAt: -1 }).toArray();
+    const normed = await Promise.all(raw.map(normBooking));
+    res.json(normed);
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
-    if (!flightId || !cabinClass || !passengers?.length) {
+app.post('/api/bookings', auth, async (req, res) => {
+  try {
+    const { flightId, class: cabinClass, passengers, seatNumbers } = req.body;
+    if (!flightId || !cabinClass || !passengers?.length)
       return res.status(400).json({ error: 'Missing required fields' });
-    }
 
-    const flight = await Flight.findById(flightId);
-    if (!flight) return res.status(404).json({ error: 'Flight not found' });
+    let rawFlight;
+    try       { rawFlight = await db.collection('flights').findOne({ _id: new ObjectId(flightId) }); }
+    catch (_) { rawFlight = await db.collection('flights').findOne({ _id: flightId }); }
+    if (!rawFlight) return res.status(404).json({ error: 'Flight not found' });
 
-    const classData = flight.classes[cabinClass];
-    if (!classData) return res.status(400).json({ error: 'Invalid cabin class' });
-    if (classData.availableSeats < passengers.length) {
-      return res.status(409).json({ error: 'Insufficient seats available' });
-    }
+    const flight    = normFlight(rawFlight);
+    const miles     = flight.milesEarned[cabinClass] || 0;
+    const paxName   = `${passengers[0]?.firstName || ''} ${passengers[0]?.lastName || ''}`.trim();
+    const pnr       = `${rawFlight.fnum}-${Math.random().toString(36).substr(2,6).toUpperCase()}`;
+    const seat      = seatNumbers?.[0] || null;
 
-    // Generate PNR (6-char alphanumeric)
-    const pnr = (Math.random().toString(36).substr(2, 6)).toUpperCase();
-
-    // Generate seat numbers
-    const rowStart = cabinClass === 'first' ? 1 : cabinClass === 'business' ? 8 : 20;
-    const cols = ['A','B','C','D','E','F'];
-    const seatNumbers = passengers.map((_, i) => {
-      const row = rowStart + Math.floor(i / 6) + Math.floor(Math.random() * 5);
-      return `${row}${cols[i % 6]}`;
-    });
-
-    const totalPrice = classData.price * passengers.length;
-    const totalMiles = (flight.milesEarned[cabinClass] || 1000) * passengers.length;
-
-    const booking = await Booking.create({
-      discordId:      req.user.discordId,
-      flightId:       flight._id,
-      flightNumber:   flight.flightNumber,
-      pnr,
-      class:          cabinClass,
+    // Write in bot-compatible format
+    await db.collection('bookings').insertOne({
+      code:       pnr,
+      fnum:       rawFlight.fnum,
+      class:      cabinClass.charAt(0).toUpperCase() + cabinClass.slice(1),
+      discordId:  req.user.discordId,
+      robloxUser: paxName,
+      checkedIn:  false,
+      seat,
       passengers,
-      price:          totalPrice,
-      milesEarned:    totalMiles,
-      seatNumbers,
-      origin:         flight.origin,
-      originCity:     flight.originCity,
-      destination:    flight.destination,
-      destinationCity: flight.destinationCity,
-      departureTime:  flight.departureTime,
-      arrivalTime:    flight.arrivalTime,
-      aircraft:       flight.aircraft,
-      duration:       flight.duration
+      bookedAt:   new Date(),
+      createdAt:  new Date(),
+      updatedAt:  new Date()
     });
 
-    // Decrement available seats
-    await Flight.findByIdAndUpdate(flightId, {
-      $inc: { [`classes.${cabinClass}.availableSeats`]: -passengers.length }
+    res.status(201).json({
+      pnr,
+      milesEarned:   miles,
+      seatNumbers:   seat ? [seat] : [],
+      flightNumber:  rawFlight.fnum,
+      origin:        rawFlight.departure,
+      destination:   rawFlight.arrival,
+      departureTime: new Date(rawFlight.time * 1000)
     });
-
-    // Add miles & transaction
-    await Reward.findOneAndUpdate(
-      { discordId: req.user.discordId },
-      {
-        $inc: { totalMilesEarned: totalMiles, availableMiles: totalMiles },
-        $push: {
-          transactions: {
-            type:        'earned',
-            miles:       totalMiles,
-            description: `${flight.flightNumber} — ${flight.originCity} → ${flight.destinationCity}`,
-            flightNumber: flight.flightNumber,
-            pnr,
-            date:        new Date()
-          }
-        },
-        updatedAt: new Date()
-      },
-      { upsert: true }
-    );
-
-    // Check tier upgrade
-    const reward = await Reward.findOne({ discordId: req.user.discordId });
-    const miles  = reward?.totalMilesEarned || 0;
-    let newTier  = 'Blue';
-    if (miles >= 150000) newTier = 'Platinum';
-    else if (miles >= 50000) newTier = 'Gold';
-    else if (miles >= 25000) newTier = 'Silver';
-
-    if (newTier !== reward?.tier) {
-      await Reward.findOneAndUpdate({ discordId: req.user.discordId }, { tier: newTier });
-      await mongoose.connection.db.collection('botconfigs').updateOne(
-        { discordId: req.user.discordId }, { $set: { tier: newTier } }
-      );
-    }
-
-    res.status(201).json({ booking, pnr, milesEarned: totalMiles, tier: newTier });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
 
-app.get('/api/bookings', authenticate, async (req, res) => {
+app.patch('/api/bookings/:id/cancel', auth, async (req, res) => {
   try {
-    const bookings = await Booking.find({ discordId: req.user.discordId }).sort({ bookedAt: -1 });
-    res.json(bookings);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/bookings/:pnr', authenticate, async (req, res) => {
-  try {
-    const booking = await Booking.findOne({ pnr: req.params.pnr, discordId: req.user.discordId });
+    let oid;
+    try { oid = new ObjectId(req.params.id); } catch { oid = req.params.id; }
+    const booking = await db.collection('bookings').findOne({ _id: oid, discordId: req.user.discordId });
     if (!booking) return res.status(404).json({ error: 'Booking not found' });
-    res.json(booking);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.patch('/api/bookings/:id/cancel', authenticate, async (req, res) => {
-  try {
-    const booking = await Booking.findOne({ _id: req.params.id, discordId: req.user.discordId });
-    if (!booking) return res.status(404).json({ error: 'Booking not found' });
-    if (booking.status === 'cancelled') return res.status(400).json({ error: 'Already cancelled' });
-
-    booking.status = 'cancelled';
-    await booking.save();
-
-    // Restore seats
-    await Flight.findByIdAndUpdate(booking.flightId, {
-      $inc: { [`classes.${booking.class}.availableSeats`]: booking.passengers.length }
-    });
-
-    // Deduct miles
-    await Reward.findOneAndUpdate(
-      { discordId: req.user.discordId },
-      {
-        $inc: { availableMiles: -booking.milesEarned },
-        $push: {
-          transactions: {
-            type:        'cancelled',
-            miles:       -booking.milesEarned,
-            description: `Cancellation — ${booking.pnr}`,
-            pnr:         booking.pnr,
-            date:        new Date()
-          }
-        }
-      }
-    );
-
-    res.json({ message: 'Booking cancelled successfully' });
+    await db.collection('bookings').updateOne({ _id: oid }, { $set: { status: 'cancelled', updatedAt: new Date() } });
+    res.json({ message: 'Booking cancelled' });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
 /* ─────────────────────────────────────────
-   REWARDS / SKYWARDS ROUTES
+   REWARDS — /api/rewards
 ───────────────────────────────────────── */
-app.get('/api/rewards', authenticate, async (req, res) => {
+app.get('/api/rewards', auth, async (req, res) => {
   try {
-    const rewards = await Reward.findOne({ discordId: req.user.discordId });
-    res.json(rewards);
+    const raw = await db.collection('rewards').findOne({ _id: req.user.discordId });
+    res.json(normRewards(raw, req.user.discordId));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
 });
 
-
-
 /* ─────────────────────────────────────────
-   CATCH-ALL → serve index.html
+   CATCH-ALL
 ───────────────────────────────────────── */
 app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`✈️  Emirates API running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`✈️  Emirates API running on port ${PORT}`));
