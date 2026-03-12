@@ -12,6 +12,9 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 const JWT  = process.env.JWT_SECRET || 'emirates_secret_2024';
 
+const GUILD_ID  = process.env.DISCORD_GUILD_ID;
+const BOT_TOKEN = process.env.DISCORD_BOT_TOKEN;
+
 /* ─────────────────────────────────────────
    MIDDLEWARE
 ───────────────────────────────────────── */
@@ -36,13 +39,44 @@ mongoose.connect(process.env.MONGODB_URI)
   .catch(err => console.error('❌ MongoDB error:', err));
 
 /* ─────────────────────────────────────────
+   DYNAMIC PRICING
+───────────────────────────────────────── */
+const SEAT_TOTALS  = { economy: 150, business: 30, first: 14 };
+const BASE_PRICES  = { economy: 299,  business: 1499, first: 3999 };
+
+function dynamicPrice(cls, available) {
+  const total = SEAT_TOTALS[cls] || 150;
+  const base  = BASE_PRICES[cls] || 299;
+  const fill  = Math.max(0, 1 - (available / total)); // 0 = empty, 1 = full
+  const multiplier = 1 + fill * 1.8;                  // up to 2.8x when full
+  return Math.round(base * multiplier / 10) * 10;      // round to nearest $10
+}
+
+/* ─────────────────────────────────────────
+   SEAT TRACKING — lazy init per flight
+───────────────────────────────────────── */
+async function getSeats(flightId) {
+  const id = flightId.toString();
+  let doc = await db.collection('flightSeats').findOne({ flightId: id });
+  if (!doc) {
+    doc = { flightId: id, economy: 150, business: 30, first: 14 };
+    await db.collection('flightSeats').insertOne(doc);
+  }
+  // Clamp to 0
+  return {
+    economy:  Math.max(0, doc.economy  ?? 150),
+    business: Math.max(0, doc.business ?? 30),
+    first:    Math.max(0, doc.first    ?? 14)
+  };
+}
+
+/* ─────────────────────────────────────────
    NORMALIZERS — map bot schema → frontend
 ───────────────────────────────────────── */
-
-// Bot flight fields: fnum, departure, arrival, time (unix secs), skywardsMiles, status (UPPERCASE), aircraft
-function normFlight(f) {
+function normFlight(f, seats) {
   if (!f) return null;
-  const miles = f.skywardsMiles || 1000;
+  const miles  = f.skywardsMiles || 1000;
+  const s      = seats || { economy: 150, business: 30, first: 14 };
   return {
     _id:             f._id,
     flightNumber:    f.fnum,
@@ -58,10 +92,11 @@ function normFlight(f) {
     imageUrl:        f.imageUrl  || null,
     eventUrl:        f.eventUrl  || null,
     skywardsMiles:   miles,
+    seats:           s,
     classes: {
-      economy:  { price: 0, availableSeats: 80, totalSeats: 200 },
-      business: { price: 0, availableSeats: 20, totalSeats: 42  },
-      first:    { price: 0, availableSeats: 8,  totalSeats: 14  }
+      economy:  { price: dynamicPrice('economy',  s.economy),  availableSeats: s.economy,  totalSeats: 150 },
+      business: { price: dynamicPrice('business', s.business), availableSeats: s.business, totalSeats: 30  },
+      first:    { price: dynamicPrice('first',    s.first),    availableSeats: s.first,    totalSeats: 14  }
     },
     milesEarned: {
       economy:  Math.round(miles * 0.5),
@@ -71,7 +106,7 @@ function normFlight(f) {
   };
 }
 
-// Bot rewards: _id = discordId string, miles, lifetimeMiles, tier, flightsCompleted
+// Bot rewards: _id = discordId string
 function normRewards(r, discordId) {
   if (!r) return null;
   return {
@@ -86,7 +121,6 @@ function normRewards(r, discordId) {
   };
 }
 
-// Bot booking fields: code (PNR), fnum, class (capitalised), discordId, checkedIn, robloxUser
 async function normBooking(b) {
   let flight = null;
   if (b.fnum) {
@@ -99,7 +133,7 @@ async function normBooking(b) {
     pnr:             b.code,
     flightNumber:    b.fnum,
     class:           (b.class || 'economy').toLowerCase(),
-    status:          b.checkedIn ? 'checked-in' : 'confirmed',
+    status:          b.checkedIn ? 'checked-in' : (b.status || 'confirmed'),
     origin:          flight?.departure || '—',
     originCity:      flight?.departure || '—',
     destination:     flight?.arrival   || '—',
@@ -107,11 +141,63 @@ async function normBooking(b) {
     departureTime:   flight ? new Date(flight.time * 1000) : (b.bookedAt || new Date()),
     aircraft:        flight?.aircraft  || '—',
     milesEarned:     flight?.skywardsMiles || 0,
-    price:           0,
-    passengers:      b.robloxUser ? [{ firstName: b.robloxUser, lastName: '' }] : [],
+    price:           b.price || 0,
+    passengers:      b.robloxUser ? [{ firstName: b.robloxUser, lastName: '' }] : (b.passengers || []),
     seatNumbers:     b.seat ? [b.seat] : [],
     bookedAt:        b.bookedAt || b.createdAt || new Date()
   };
+}
+
+/* ─────────────────────────────────────────
+   DISCORD ROLE → CLASS ACCESS
+   Roles (case-insensitive match):
+     first / very important / vip → 'first'
+     business / premium           → 'business'
+     economy / (default)          → 'economy'
+───────────────────────────────────────── */
+async function resolveClassAccess(access_token) {
+  if (!GUILD_ID || !BOT_TOKEN) return { classAccess: 'economy', roleName: 'Economy' };
+  try {
+    const [memberRes, rolesRes] = await Promise.all([
+      axios.get(`https://discord.com/api/users/@me/guilds/${GUILD_ID}/member`, {
+        headers: { Authorization: `Bearer ${access_token}` }
+      }),
+      axios.get(`https://discord.com/api/guilds/${GUILD_ID}/roles`, {
+        headers: { Authorization: `Bot ${BOT_TOKEN}` }
+      })
+    ]);
+
+    const userRoleIds = memberRes.data.roles || [];
+    const guildRoles  = rolesRes.data || [];
+
+    const userRoles = guildRoles
+      .filter(r => userRoleIds.includes(r.id))
+      .map(r => ({ id: r.id, name: r.name, position: r.position }))
+      .sort((a, b) => b.position - a.position); // highest position first
+
+    for (const role of userRoles) {
+      const n = role.name.toLowerCase();
+      if (n.includes('first') || n.includes('very important') || n.includes('vip')) {
+        return { classAccess: 'first', roleName: role.name };
+      }
+    }
+    for (const role of userRoles) {
+      const n = role.name.toLowerCase();
+      if (n.includes('business') || n.includes('premium')) {
+        return { classAccess: 'business', roleName: role.name };
+      }
+    }
+    for (const role of userRoles) {
+      const n = role.name.toLowerCase();
+      if (n.includes('economy')) {
+        return { classAccess: 'economy', roleName: role.name };
+      }
+    }
+    return { classAccess: 'economy', roleName: 'Economy' };
+  } catch (err) {
+    console.warn('Role fetch failed:', err.response?.status, err.message);
+    return { classAccess: 'economy', roleName: 'Economy' };
+  }
 }
 
 /* ─────────────────────────────────────────
@@ -128,11 +214,12 @@ const auth = (req, res, next) => {
    DISCORD OAUTH
 ───────────────────────────────────────── */
 app.get('/auth/discord', (req, res) => {
+  const scopes = ['identify', 'guilds.members.read'].join(' ');
   const params = new URLSearchParams({
     client_id:     process.env.DISCORD_CLIENT_ID,
     redirect_uri:  process.env.DISCORD_REDIRECT_URI,
     response_type: 'code',
-    scope:         'identify'
+    scope:         scopes
   });
   res.redirect(`https://discord.com/api/oauth2/authorize?${params}`);
 });
@@ -156,20 +243,25 @@ app.get('/auth/discord/callback', async (req, res) => {
     );
 
     const { access_token } = tokenRes.data;
-    const userRes = await axios.get('https://discord.com/api/users/@me', {
-      headers: { Authorization: `Bearer ${access_token}` }
-    });
+    const [userRes, roleData] = await Promise.all([
+      axios.get('https://discord.com/api/users/@me', {
+        headers: { Authorization: `Bearer ${access_token}` }
+      }),
+      resolveClassAccess(access_token)
+    ]);
     const discord = userRes.data;
 
-    // Bot stores rewards with _id = discordId string
+    // Bot rewards: _id = discordId string
     const rewards = await db.collection('rewards').findOne({ _id: discord.id });
     const tier    = rewards?.tier || 'Blue';
 
     const token = jwt.sign({
-      discordId: discord.id,
-      username:  discord.username,
-      avatar:    discord.avatar,
-      tier
+      discordId:   discord.id,
+      username:    discord.username,
+      avatar:      discord.avatar,
+      tier,
+      classAccess: roleData.classAccess,
+      roleName:    roleData.roleName
     }, JWT, { expiresIn: '7d' });
 
     res.redirect(`${frontend}?token=${token}`);
@@ -185,15 +277,19 @@ app.get('/auth/logout', (req, res) => {
 });
 
 /* ─────────────────────────────────────────
-   USER — /api/me
+   /api/me
 ───────────────────────────────────────── */
 app.get('/api/me', auth, async (req, res) => {
   try {
-    const { discordId, username, avatar } = req.user;
-    // Bot rewards: _id = discordId string (NOT an ObjectId)
+    const { discordId, username, avatar, classAccess, roleName } = req.user;
     const raw = await db.collection('rewards').findOne({ _id: discordId });
     res.json({
-      user: { discordId, username, avatar, skywardsNumber: `EK${discordId}`.substring(0, 12) },
+      user: {
+        discordId, username, avatar,
+        skywardsNumber: `EK${discordId}`.substring(0, 12),
+        classAccess:    classAccess || 'economy',
+        roleName:       roleName    || 'Economy'
+      },
       rewards: normRewards(raw, discordId)
     });
   } catch (e) {
@@ -204,15 +300,20 @@ app.get('/api/me', auth, async (req, res) => {
 /* ─────────────────────────────────────────
    FLIGHTS
 ───────────────────────────────────────── */
+async function enrichFlights(rawFlights) {
+  return Promise.all(rawFlights.map(async f => {
+    const seats = await getSeats(f._id.toString());
+    return normFlight(f, seats);
+  }));
+}
+
 app.get('/api/flights/popular', async (req, res) => {
   try {
     const nowUnix = Math.floor(Date.now() / 1000);
-    const flights = await db.collection('flights')
+    const raw = await db.collection('flights')
       .find({ status: { $nin: ['CANCELLED', 'COMPLETED'] }, time: { $gte: nowUnix } })
-      .sort({ time: 1 })
-      .limit(10)
-      .toArray();
-    res.json(flights.map(normFlight));
+      .sort({ time: 1 }).limit(10).toArray();
+    res.json(await enrichFlights(raw));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -230,8 +331,8 @@ app.get('/api/flights', async (req, res) => {
       dEnd.setDate(dEnd.getDate() + 1);
       query.time = { $gte: Math.floor(d / 1000), $lt: Math.floor(dEnd / 1000) };
     }
-    const flights = await db.collection('flights').find(query).sort({ time: 1 }).limit(30).toArray();
-    res.json(flights.map(normFlight));
+    const raw = await db.collection('flights').find(query).sort({ time: 1 }).limit(30).toArray();
+    res.json(await enrichFlights(raw));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -243,7 +344,8 @@ app.get('/api/flights/:id', async (req, res) => {
     try       { f = await db.collection('flights').findOne({ _id: new ObjectId(req.params.id) }); }
     catch (_) { f = await db.collection('flights').findOne({ _id: req.params.id }); }
     if (!f) return res.status(404).json({ error: 'Flight not found' });
-    res.json(normFlight(f));
+    const seats = await getSeats(f._id.toString());
+    res.json(normFlight(f, seats));
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -273,13 +375,20 @@ app.post('/api/bookings', auth, async (req, res) => {
     catch (_) { rawFlight = await db.collection('flights').findOne({ _id: flightId }); }
     if (!rawFlight) return res.status(404).json({ error: 'Flight not found' });
 
-    const flight    = normFlight(rawFlight);
-    const miles     = flight.milesEarned[cabinClass] || 0;
-    const paxName   = `${passengers[0]?.firstName || ''} ${passengers[0]?.lastName || ''}`.trim();
-    const pnr       = `${rawFlight.fnum}-${Math.random().toString(36).substr(2,6).toUpperCase()}`;
-    const seat      = seatNumbers?.[0] || null;
+    // Check seat availability
+    const seats = await getSeats(rawFlight._id.toString());
+    if ((seats[cabinClass] || 0) <= 0) {
+      return res.status(409).json({ error: 'No seats available in this class' });
+    }
 
-    // Write in bot-compatible format
+    const flight   = normFlight(rawFlight, seats);
+    const miles    = flight.milesEarned[cabinClass] || 0;
+    const price    = flight.classes[cabinClass]?.price || 0;
+    const paxName  = `${passengers[0]?.firstName || ''} ${passengers[0]?.lastName || ''}`.trim();
+    const pnr      = `${rawFlight.fnum}-${Math.random().toString(36).substr(2,6).toUpperCase()}`;
+    const seat     = seatNumbers?.[0] || null;
+
+    // Write booking in bot-compatible format
     await db.collection('bookings').insertOne({
       code:       pnr,
       fnum:       rawFlight.fnum,
@@ -288,15 +397,25 @@ app.post('/api/bookings', auth, async (req, res) => {
       robloxUser: paxName,
       checkedIn:  false,
       seat,
+      price,
       passengers,
+      status:     'confirmed',
       bookedAt:   new Date(),
       createdAt:  new Date(),
       updatedAt:  new Date()
     });
 
+    // Decrement seats by 10 per booking
+    await db.collection('flightSeats').updateOne(
+      { flightId: rawFlight._id.toString() },
+      { $inc: { [cabinClass]: -10 } },
+      { upsert: true }
+    );
+
     res.status(201).json({
       pnr,
       milesEarned:   miles,
+      price,
       seatNumbers:   seat ? [seat] : [],
       flightNumber:  rawFlight.fnum,
       origin:        rawFlight.departure,
@@ -323,7 +442,7 @@ app.patch('/api/bookings/:id/cancel', auth, async (req, res) => {
 });
 
 /* ─────────────────────────────────────────
-   REWARDS — /api/rewards
+   REWARDS
 ───────────────────────────────────────── */
 app.get('/api/rewards', auth, async (req, res) => {
   try {
